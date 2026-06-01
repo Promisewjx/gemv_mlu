@@ -50,7 +50,21 @@ make -j
 ./test/test_gemv single 1
 ./test/test_gemv_union1
 ctest --output-on-failure
+
+# baseline
+GEMV_IMPL=baseline ./test/test_gemv
 ```
+
+## 分析
+
+```bash
+cd /home/LCUDA/wjx/gemv_mlu
+
+python3 autotuner/analyze_gemv_logs.py \
+--logs baseline=build/results/baseline.log opt1=build/results/opt_sram.log \
+--out-dir build/analysis
+```
+
 
 ## 自适应调优
 
