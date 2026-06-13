@@ -30,8 +30,24 @@ if(HAVE_MLU)
     message(STATUS "Building GEMV with MLU (Cambricon) support")
     set(NEUWARE_HOME "/usr/local/neuware" CACHE PATH "Cambricon Neuware installation path")
     set(MLU_ARCH 270 CACHE STRING "MLU target architecture, for example 270 or 592")
+    set(GEMV_NRAM_CHUNK_FLOATS 256 CACHE STRING "NRAM chunk size in floats for GEMV MLU kernels")
+    set(GEMV_TILE_SRAM_BLOCK_ROWS 16 CACHE STRING "SRAM row block size for tiled GEMV MLU kernels")
     set(GEMV_UNROLL_FACTOR 1 CACHE STRING "Tail scalar accumulation unroll factor for MLU GEMV kernels")
     set(CNCC_COMPILER "${NEUWARE_HOME}/bin/cncc" CACHE FILEPATH "Path to cncc compiler")
+    set(GEMV_MLU_CONFIG_STAMP "${CMAKE_CURRENT_BINARY_DIR}/gemv_mlu_config.stamp")
+    string(CONCAT GEMV_MLU_CONFIG_CONTENT
+        "NRAM_CHUNK_FLOATS=${GEMV_NRAM_CHUNK_FLOATS}\n"
+        "TILE_SRAM_BLOCK_ROWS=${GEMV_TILE_SRAM_BLOCK_ROWS}\n"
+        "UNROLL_FACTOR=${GEMV_UNROLL_FACTOR}\n"
+    )
+    if(EXISTS "${GEMV_MLU_CONFIG_STAMP}")
+        file(READ "${GEMV_MLU_CONFIG_STAMP}" GEMV_MLU_CONFIG_OLD)
+    else()
+        set(GEMV_MLU_CONFIG_OLD "")
+    endif()
+    if(NOT GEMV_MLU_CONFIG_OLD STREQUAL GEMV_MLU_CONFIG_CONTENT)
+        file(WRITE "${GEMV_MLU_CONFIG_STAMP}" "${GEMV_MLU_CONFIG_CONTENT}")
+    endif()
 
     message(STATUS "Using MLU architecture: mtp_${MLU_ARCH}")
     message(STATUS "Using cncc compiler: ${CNCC_COMPILER}")
@@ -56,9 +72,11 @@ if(HAVE_MLU)
                 -I${CMAKE_CURRENT_SOURCE_DIR}/include
                 -I${NEUWARE_HOME}/include
                 --bang-mlu-arch=mtp_${MLU_ARCH}
+                -DNRAM_CHUNK_FLOATS=${GEMV_NRAM_CHUNK_FLOATS}
+                -DTILE_SRAM_BLOCK_ROWS=${GEMV_TILE_SRAM_BLOCK_ROWS}
                 -DUNROLL_FACTOR=${GEMV_UNROLL_FACTOR}
                 -O2
-            DEPENDS ${kernel}
+            DEPENDS ${kernel} ${GEMV_MLU_CONFIG_STAMP}
             COMMENT "Compiling MLU kernel ${kernel_rel_path} with cncc"
             VERBATIM
         )
