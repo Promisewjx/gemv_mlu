@@ -72,6 +72,7 @@ GEMV_IMPL=tile_nram    ./test/test_gemv
 GEMV_IMPL=tile_nram_db ./test/test_gemv
 GEMV_IMPL=tile_sram    ./test/test_gemv
 GEMV_IMPL=tile_sram_db ./test/test_gemv
+GEMV_IMPL=tile_sram_xreuse ./test/test_gemv
 GEMV_IMPL=blas_style   ./test/test_gemv
 ```
 
@@ -86,6 +87,7 @@ If `GEMV_IMPL` is not set, the current host path defaults to `blas_style`.
 | `tile_nram_db` | Adds NRAM ping-pong double buffering to `tile_nram`. |
 | `tile_sram` | Tiles A through `GDRAM -> SRAM -> NRAM` to improve A movement and reuse. |
 | `tile_sram_db` | Adds SRAM ping-pong double buffering to `tile_sram`. Current best manually designed kernel. |
+| `tile_sram_xreuse` | Experimental `tile_sram_db` variant that stages x through SRAM before each core loads it into NRAM. |
 | `blas_style` | BLAS-style prologue / steady-state / epilogue implementation based on the SRAM tiled path. |
 
 ## Benchmark
@@ -100,7 +102,7 @@ cd /home/LCUDA/wjx/gemv_mlu
 The script benchmarks:
 
 ```text
-baseline -> tile_nram -> tile_nram_db -> tile_sram -> tile_sram_db -> blas_style
+baseline -> tile_nram -> tile_nram_db -> tile_sram -> tile_sram_db -> tile_sram_xreuse -> blas_style
 ```
 
 Important outputs:
@@ -177,6 +179,34 @@ Tuned-vs-default result, repeated 3 times and averaged:
 | `tile_sram_db_bo_best` | 33/33 | 1.1419 | 1.0714 | 1.4584 | 0.9000 | 1.8688 |
 
 The tuned configuration improves the geometric mean by about `14.19%`. The strongest gains are on unit-stride cases (`1.2171x` gmean), while non-unit-stride cases improve less (`1.0671x` gmean).
+
+To compare `tile_sram_xreuse` with both default and BO-tuned parameters:
+
+```bash
+./autotuner/run_tile_sram_xreuse_tuned_compare.sh \
+  --repeat 3 \
+  --out-dir build/perf_tile_sram_xreuse_tuned
+```
+
+This report uses `tile_sram_db_default` as the baseline and includes:
+
+```text
+tile_sram_db_default
+tile_sram_xreuse_default
+tile_sram_db_bo_best
+tile_sram_xreuse_bo_best
+```
+
+Current x-reuse comparison result:
+
+| Implementation | Pass | GMean Speedup | p50 | p90 | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|
+| `tile_sram_db_default` | 33/33 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| `tile_sram_xreuse_default` | 33/33 | 1.1850 | 0.9902 | 2.5334 | 0.7068 | 2.7265 |
+| `tile_sram_db_bo_best` | 33/33 | 1.1358 | 1.0707 | 1.4480 | 0.9000 | 1.8610 |
+| `tile_sram_xreuse_bo_best` | 33/33 | 1.4007 | 1.0969 | 2.8743 | 0.9000 | 3.3696 |
+
+`tile_sram_xreuse_bo_best` is the fastest configuration in this comparison. The benefit mainly comes from non-unit-stride cases: `incx=3,incy=2` reaches `1.6726x`, while `incx=1,incy=1` is `1.1854x`.
 
 ## Notes
 
