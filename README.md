@@ -76,8 +76,14 @@ GEMV_IMPL=baseline ./test/test_gemv
 # 只做 GDRAM -> NRAM 分块搬运和 NRAM 向量计算
 GEMV_IMPL=tile_nram ./test/test_gemv
 
+# 在 tile_nram 基础上加入 NRAM ping-pong 双缓冲
+GEMV_IMPL=tile_nram_db ./test/test_gemv
+
 # 做 GDRAM -> SRAM -> NRAM 分块搬运，不使用双缓冲流水线
 GEMV_IMPL=tile_sram ./test/test_gemv
+
+# 在 tile_sram 基础上加入 SRAM ping-pong 双缓冲
+GEMV_IMPL=tile_sram_db ./test/test_gemv
 
 # 不设置 GEMV_IMPL 时，使用默认优化版 kernel
 ./test/test_gemv
@@ -88,7 +94,9 @@ GEMV_IMPL=tile_sram ./test/test_gemv
 ```bash
 GEMV_IMPL=baseline ./test/test_gemv single 25
 GEMV_IMPL=tile_nram ./test/test_gemv single 9
+GEMV_IMPL=tile_nram_db ./test/test_gemv single 9
 GEMV_IMPL=tile_sram ./test/test_gemv single 15
+GEMV_IMPL=tile_sram_db ./test/test_gemv single 15
 ```
 
 如果需要更换测试数据：
@@ -99,7 +107,7 @@ GEMV_SEED=123 GEMV_IMPL=baseline ./test/test_gemv
 
 ## 性能对比
 
-推荐用脚本一次性测试 `baseline -> tile_nram -> tile_sram` 三个阶段，并自动生成日志和加速比表格：
+推荐用脚本一次性测试 `baseline -> tile_nram -> tile_nram_db -> tile_sram -> tile_sram_db` 五个阶段，并自动生成日志和加速比表格：
 
 ```bash
 cd /home/LCUDA/wjx/gemv_mlu
@@ -114,23 +122,32 @@ cd /home/LCUDA/wjx/gemv_mlu
 ```text
 GEMV_IMPL=baseline
 GEMV_IMPL=tile_nram
+GEMV_IMPL=tile_nram_db
 GEMV_IMPL=tile_sram
+GEMV_IMPL=tile_sram_db
 ```
 
-每轮都会生成独立日志和分析结果：
+每轮都会生成独立日志和单轮分析结果；当 `--repeat > 1` 时，脚本还会额外生成三次平均后的最终分析结果：
 
 ```text
 build/perf_baseline_nram_sram/
 ├── logs/
 │   ├── baseline_r1.log
 │   ├── tile_nram_r1.log
-│   └── tile_sram_r1.log
+│   ├── tile_nram_db_r1.log
+│   ├── tile_sram_r1.log
+│   └── tile_sram_db_r1.log
 ├── analysis_r1/
 │   ├── gemv_speedup_summary.md
 │   └── gemv_speedup_details.csv
 ├── analysis_r2/
-└── analysis_r3/
+├── analysis_r3/
+└── analysis_avg/
+    ├── gemv_speedup_summary.md
+    └── gemv_speedup_details.csv
 ```
+
+最终写性能表格时，优先使用 `analysis_avg/` 下的结果。`analysis_r1/analysis_r2/analysis_r3` 主要用于观察单轮波动。
 
 快速检查可以只跑 quick：
 
@@ -157,10 +174,12 @@ speedup = baseline_time / impl_time
 ```text
 baseline   gmean_speedup = 1.0000
 tile_nram  gmean_speedup = 8.2936
+tile_nram_db ...
 tile_sram  gmean_speedup = 10.0467
+tile_sram_db ...
 ```
 
-表示在所有样例上，`tile_nram` 相比 baseline 的几何平均加速约为 `8.29x`，`tile_sram` 相比 baseline 的几何平均加速约为 `10.05x`。
+表示其他实现的耗时相对 baseline 的加速倍数。`tile_nram_db` 和 `tile_sram_db` 用于观察在 NRAM/SRAM 分块基础上加入双缓冲后的收益。
 
 表格字段含义：
 
@@ -171,7 +190,18 @@ tile_sram  gmean_speedup = 10.0467
 - `min`：最差 case 加速比，小于 1 表示比 baseline 慢。
 - `max`：最好 case 加速比。
 
-`gemv_speedup_details.csv` 是逐 case 细节，包含每个实现的耗时、带宽、正确性和相对 baseline 的加速比。写实验表格时建议优先使用这个 CSV。
+`gemv_speedup_details.csv` 是逐 case 细节。单轮分析中包含每个实现的耗时、带宽、正确性和相对 baseline 的加速比；平均分析中包含 `avg_time_ms`、`time_stdev_ms`、`avg_bandwidth_kbs`、`pass_count` 和基于平均耗时计算的加速比。写实验表格时建议优先使用 `analysis_avg/gemv_speedup_details.csv`。
+
+### 双缓冲收益判断
+
+双缓冲的收益需要结合 `tile_nram` 和 `tile_sram` 的基线分别判断，而不是只看相对 baseline 的加速比。推荐在 `gemv_speedup_details.csv` 中计算：
+
+```text
+tile_nram_db_vs_tile_nram = tile_nram_time / tile_nram_db_time
+tile_sram_db_vs_tile_sram = tile_sram_time / tile_sram_db_time
+```
+
+当前测试中，`tile_nram_db` 对连续访存样例更有效，`incx=1` 时几何平均约有 `1.24x - 1.25x` 的额外收益；但 `incx=3` 时 x 需要逐元素 gather，双缓冲基本无法隐藏这种小粒度访存，收益接近 `1.0x`。`tile_sram_db` 的整体收益更小，通常只有约 `1.00x - 1.02x`，原因是 `tile_sram` 之后瓶颈不再只是 A 的 `GDRAM -> SRAM` 搬运，还包括 x 加载、`SRAM -> NRAM`、规约计算和每个 tile 后的同步开销。因此，GEMV 是 memory-bound 并不意味着双缓冲一定有明显收益，关键要看当前瓶颈是否正好是双缓冲能覆盖的那段搬运。
 
 ### 手动分析已有日志
 
@@ -184,7 +214,9 @@ python3 autotuner/analyze_gemv_logs.py \
   --logs \
   baseline=build/results/baseline.log \
   tile_nram=build/results/tile_nram.log \
+  tile_nram_db=build/results/tile_nram_db.log \
   tile_sram=build/results/tile_sram.log \
+  tile_sram_db=build/results/tile_sram_db.log \
   --out-dir build/analysis
 ```
 
@@ -196,9 +228,13 @@ python3 autotuner/analyze_gemv_logs.py \
 
 - `baseline`：逐元素从 GDRAM 读入 NRAM，做标量乘加，作为性能基准。
 - `tile_nram`：按 `NRAM_CHUNK_FLOATS` 分块，从 GDRAM 批量搬运到 NRAM，用 `__bang_mul` 和 `__bang_reduce_sum` 做向量化计算。
+- `tile_nram_db`：在 `tile_nram` 基础上加入 NRAM ping-pong 双缓冲，当前 tile 计算时预取下一个 tile。
 - `tile_sram`：按行块和列块分块，先将 A tile 从 GDRAM 搬到 SRAM，再由各 core 搬到 NRAM 计算，用于观察 `GDRAM -> SRAM -> NRAM` 数据路径的收益。
+- `tile_sram_db`：在 `tile_sram` 基础上加入 SRAM ping-pong 双缓冲，当前 A tile 计算时预取下一个 A tile。
 
 分块带来加速的主要原因是：baseline 逐元素搬运会产生大量小粒度 GDRAM 访问，带宽利用率低；分块后可以批量连续搬运，并在 NRAM 上用向量指令完成乘法和规约。`tile_sram` 进一步改善了 A tile 的搬运和组织方式，因此通常会比 `tile_nram` 更快。对于 `incx != 1` 的样例，x 需要逐元素 gather，访存效率下降，加速幅度会明显小于单位步长样例。
+
+当前数据表明，后续更值得优先优化的是非单位步长 `x` 的 gather、x tile 复用和同步开销，而不是继续单独增加 A tile 的双缓冲层级。
 
 ## 编译期参数
 

@@ -97,7 +97,7 @@ case "${MODE}" in
         ;;
 esac
 
-impls=("baseline" "tile_nram" "tile_sram")
+impls=("baseline" "tile_nram" "tile_nram_db" "tile_sram" "tile_sram_db")
 
 for ((round = 1; round <= REPEAT; ++round)); do
     round_logs=()
@@ -121,6 +121,23 @@ for ((round = 1; round <= REPEAT; ++round)); do
         --out-dir "${analysis_dir}"
 done
 
+avg_logs=()
+for impl in "${impls[@]}"; do
+    impl_logs=()
+    for ((round = 1; round <= REPEAT; ++round)); do
+        impl_logs+=("${OUT_DIR}/logs/${impl}_r${round}.log")
+    done
+    joined_logs="$(IFS=,; echo "${impl_logs[*]}")"
+    avg_logs+=("${impl}=${joined_logs}")
+done
+
+avg_analysis_dir="${OUT_DIR}/analysis_avg"
+echo
+echo "[analyze averaged repeats] ${avg_analysis_dir}"
+python3 "${ROOT_DIR}/autotuner/analyze_gemv_repeats.py" \
+    --logs "${avg_logs[@]}" \
+    --out-dir "${avg_analysis_dir}"
+
 echo
 echo "Generated performance artifacts:"
 echo "- Logs: ${OUT_DIR}/logs"
@@ -128,3 +145,5 @@ for ((round = 1; round <= REPEAT; ++round)); do
     echo "- Round ${round} summary: ${OUT_DIR}/analysis_r${round}/gemv_speedup_summary.md"
     echo "- Round ${round} details: ${OUT_DIR}/analysis_r${round}/gemv_speedup_details.csv"
 done
+echo "- Averaged summary: ${OUT_DIR}/analysis_avg/gemv_speedup_summary.md"
+echo "- Averaged details: ${OUT_DIR}/analysis_avg/gemv_speedup_details.csv"

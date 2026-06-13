@@ -162,6 +162,140 @@ __mlu_entry__ void mlu_sgemv_kernel_tile_nram(
     }
 }
 
+__mlu_entry__ void mlu_sgemv_kernel_tile_nram_db(
+    char trans, int m, int n, const float alpha, const float *A, int lda,
+    const float *x, int incx, const float beta, float *y, int incy
+) {
+    const int cores_per_cluster_config = coreDim;
+    const int clusters_config = taskDimY;
+
+    size_t logic_cluster_id = taskIdY;
+    size_t logic_core_id_in_cluster = coreId;
+
+    bool is_trans = (trans == 'T' || trans == 'C');
+    int y_len = is_trans ? n : m;
+    int x_len = is_trans ? m : n;
+
+    const int nram_chunk_size = NRAM_CHUNK_FLOATS;
+    __nram__ float nram_x_ping[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_x_pong[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_A_ping[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_A_pong[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_sum[NRAM_CHUNK_FLOATS];
+
+    size_t rows_per_logic_cluster = (size_t)y_len / clusters_config;
+    size_t rem_rows_logic_cluster = (size_t)y_len % clusters_config;
+    if (rem_rows_logic_cluster > 0 && logic_cluster_id == (size_t)clusters_config - 1) {
+        rows_per_logic_cluster += rem_rows_logic_cluster;
+    }
+
+    int cluster_global_start_row = (int)logic_cluster_id * (y_len / clusters_config);
+    int cluster_global_end_row = cluster_global_start_row + (int)rows_per_logic_cluster;
+
+    if (cluster_global_start_row >= cluster_global_end_row) {
+        return;
+    }
+
+    const int max_rows_per_nram_block = TILE_NRAM_BLOCK_ROWS;
+
+    int total_rows = (int)rows_per_logic_cluster;
+    for (int block_offset = 0; block_offset < total_rows; block_offset += max_rows_per_nram_block) {
+        int rows_in_block = MIN(max_rows_per_nram_block, total_rows - block_offset);
+
+        size_t rows_per_core_in_block =
+            (rows_in_block + cores_per_cluster_config - 1) / cores_per_cluster_config;
+        size_t core_block_start = logic_core_id_in_cluster * rows_per_core_in_block;
+        size_t core_block_end =
+            MIN(core_block_start + rows_per_core_in_block, (size_t)rows_in_block);
+
+        int block_row_start = cluster_global_start_row + block_offset + (int)core_block_start;
+        int block_row_end = cluster_global_start_row + block_offset + (int)core_block_end;
+
+        for (int row = block_row_start; row < block_row_end; row++) {
+            float dot_product = 0.0f;
+            int tile_count = (x_len + nram_chunk_size - 1) / nram_chunk_size;
+
+            if (tile_count > 0) {
+                int first_size = MIN(nram_chunk_size, x_len);
+                __memcpy_async(
+                    nram_A_ping,
+                    A + row * lda,
+                    first_size * sizeof(float),
+                    GDRAM2NRAM);
+
+                if (incx == 1) {
+                    __memcpy_async(nram_x_ping, x, first_size * sizeof(float), GDRAM2NRAM);
+                } else {
+                    for (int k = 0; k < first_size; ++k) {
+                        __memcpy_async(&nram_x_ping[k], x + k * incx, sizeof(float), GDRAM2NRAM);
+                    }
+                }
+                __sync_copy_dram_to_nram();
+            }
+
+            for (int tile = 0; tile < tile_count; ++tile) {
+                int x_start = tile * nram_chunk_size;
+                int block_size = MIN(nram_chunk_size, x_len - x_start);
+
+                float *cur_A = ((tile & 1) == 0) ? nram_A_ping : nram_A_pong;
+                float *cur_x = ((tile & 1) == 0) ? nram_x_ping : nram_x_pong;
+                float *next_A = ((tile & 1) == 0) ? nram_A_pong : nram_A_ping;
+                float *next_x = ((tile & 1) == 0) ? nram_x_pong : nram_x_ping;
+
+                if (tile + 1 < tile_count) {
+                    int next_start = x_start + nram_chunk_size;
+                    int next_size = MIN(nram_chunk_size, x_len - next_start);
+
+                    __memcpy_async(
+                        next_A,
+                        A + row * lda + next_start,
+                        next_size * sizeof(float),
+                        GDRAM2NRAM);
+
+                    if (incx == 1) {
+                        __memcpy_async(
+                            next_x,
+                            x + next_start,
+                            next_size * sizeof(float),
+                            GDRAM2NRAM);
+                    } else {
+                        for (int k = 0; k < next_size; ++k) {
+                            __memcpy_async(
+                                &next_x[k],
+                                x + (next_start + k) * incx,
+                                sizeof(float),
+                                GDRAM2NRAM);
+                        }
+                    }
+                }
+
+                int aligned = (block_size / 64) * 64;
+                if (aligned > 0) {
+                    __bang_mul(cur_A, cur_A, cur_x, aligned);
+                    __bang_reduce_sum(nram_sum, cur_A, aligned);
+                    for (int k = 0; k < aligned; k += 32) {
+                        dot_product += nram_sum[k];
+                    }
+                }
+
+                for (int k = aligned; k < block_size; ++k) {
+                    dot_product += cur_A[k] * cur_x[k];
+                }
+
+                if (tile + 1 < tile_count) {
+                    __sync_copy_dram_to_nram();
+                }
+            }
+
+            __nram__ float nram_y_val;
+            __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
+            __sync_copy_dram_to_nram();
+            nram_y_val = alpha * dot_product + beta * nram_y_val;
+            __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
 __mlu_entry__ void mlu_sgemv_kernel_tile_sram(
     char trans, int m, int n, const float alpha, const float *A, int lda,
     const float *x, int incx, const float beta, float *y, int incy
@@ -265,6 +399,138 @@ __mlu_entry__ void mlu_sgemv_kernel_tile_sram(
             int row = cluster_global_start_row + block_offset + row_in_block;
             __nram__ float nram_y_val;
             __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
+            nram_y_val = alpha * dot_values[row_in_block] + beta * nram_y_val;
+            __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
+        }
+    }
+}
+
+__mlu_entry__ void mlu_sgemv_kernel_tile_sram_db(
+    char trans, int m, int n, const float alpha, const float *A, int lda,
+    const float *x, int incx, const float beta, float *y, int incy
+) {
+    const int cores_per_cluster_config = coreDim;
+    const int clusters_config = taskDimY;
+
+    size_t logic_cluster_id = taskIdY;
+    size_t logic_core_id_in_cluster = coreId;
+
+    bool is_trans = (trans == 'T' || trans == 'C');
+    int y_len = is_trans ? n : m;
+    int x_len = is_trans ? m : n;
+
+    const int nram_chunk_size = NRAM_CHUNK_FLOATS;
+    __mlu_shared__ float sram_A_ping[TILE_SRAM_BLOCK_ROWS][NRAM_CHUNK_FLOATS];
+    __mlu_shared__ float sram_A_pong[TILE_SRAM_BLOCK_ROWS][NRAM_CHUNK_FLOATS];
+    __nram__ float nram_x_block[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_A_row[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_sum[NRAM_CHUNK_FLOATS];
+
+    size_t rows_per_logic_cluster = (size_t)y_len / clusters_config;
+    size_t rem_rows_logic_cluster = (size_t)y_len % clusters_config;
+    if (rem_rows_logic_cluster > 0 && logic_cluster_id == (size_t)clusters_config - 1) {
+        rows_per_logic_cluster += rem_rows_logic_cluster;
+    }
+
+    int cluster_global_start_row = (int)logic_cluster_id * (y_len / clusters_config);
+    int cluster_global_end_row = cluster_global_start_row + (int)rows_per_logic_cluster;
+
+    if (cluster_global_start_row >= cluster_global_end_row) {
+        return;
+    }
+
+    int total_rows = (int)rows_per_logic_cluster;
+    for (int block_offset = 0; block_offset < total_rows; block_offset += TILE_SRAM_BLOCK_ROWS) {
+        int rows_in_block = MIN(TILE_SRAM_BLOCK_ROWS, total_rows - block_offset);
+
+        size_t rows_per_core_in_block =
+            (rows_in_block + cores_per_cluster_config - 1) / cores_per_cluster_config;
+        size_t core_block_start = logic_core_id_in_cluster * rows_per_core_in_block;
+        size_t core_block_end =
+            MIN(core_block_start + rows_per_core_in_block, (size_t)rows_in_block);
+
+        float dot_values[TILE_SRAM_BLOCK_ROWS];
+        for (int r = 0; r < TILE_SRAM_BLOCK_ROWS; ++r) {
+            dot_values[r] = 0.0f;
+        }
+
+        int tile_count = (x_len + nram_chunk_size - 1) / nram_chunk_size;
+        if (tile_count > 0) {
+            int first_size = MIN(nram_chunk_size, x_len);
+            for (int r = 0; r < rows_in_block; ++r) {
+                __memcpy_async(
+                    sram_A_ping[r],
+                    A + (cluster_global_start_row + block_offset + r) * lda,
+                    first_size * sizeof(float),
+                    GDRAM2SRAM);
+            }
+            __sync_all();
+        }
+
+        for (int tile = 0; tile < tile_count; ++tile) {
+            int x_start = tile * nram_chunk_size;
+            int block_size = MIN(nram_chunk_size, x_len - x_start);
+            float (*cur_sram)[NRAM_CHUNK_FLOATS] =
+                ((tile & 1) == 0) ? sram_A_ping : sram_A_pong;
+            float (*next_sram)[NRAM_CHUNK_FLOATS] =
+                ((tile & 1) == 0) ? sram_A_pong : sram_A_ping;
+
+            if (tile + 1 < tile_count) {
+                int next_start = x_start + nram_chunk_size;
+                int next_size = MIN(nram_chunk_size, x_len - next_start);
+                for (int r = 0; r < rows_in_block; ++r) {
+                    __memcpy_async(
+                        next_sram[r],
+                        A + (cluster_global_start_row + block_offset + r) * lda + next_start,
+                        next_size * sizeof(float),
+                        GDRAM2SRAM);
+                }
+            }
+
+            if (incx == 1) {
+                __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
+            } else {
+                for (int k = 0; k < block_size; ++k) {
+                    __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
+                }
+            }
+            __sync_copy_dram_to_nram();
+
+            for (int row_in_block = (int)core_block_start; row_in_block < (int)core_block_end;
+                    ++row_in_block) {
+                __memcpy(
+                    nram_A_row,
+                    cur_sram[row_in_block],
+                    block_size * sizeof(float),
+                    SRAM2NRAM);
+                __sync_copy_sram_to_nram();
+
+                float dot_product = 0.0f;
+                int aligned = (block_size / 64) * 64;
+                if (aligned > 0) {
+                    __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
+                    __bang_reduce_sum(nram_sum, nram_A_row, aligned);
+                    for (int k = 0; k < aligned; k += 32) {
+                        dot_product += nram_sum[k];
+                    }
+                }
+
+                for (int k = aligned; k < block_size; ++k) {
+                    dot_product += nram_A_row[k] * nram_x_block[k];
+                }
+
+                dot_values[row_in_block] += dot_product;
+            }
+
+            __sync_all();
+        }
+
+        for (int row_in_block = (int)core_block_start; row_in_block < (int)core_block_end;
+                ++row_in_block) {
+            int row = cluster_global_start_row + block_offset + row_in_block;
+            __nram__ float nram_y_val;
+            __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
+            __sync_copy_dram_to_nram();
             nram_y_val = alpha * dot_values[row_in_block] + beta * nram_y_val;
             __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
         }
@@ -642,7 +908,9 @@ extern "C" void mlu_BLAS_sGEMV(
     const char *impl = std::getenv("GEMV_IMPL");
     bool use_baseline = (impl != NULL) && (std::strcmp(impl, "baseline") == 0);
     bool use_tile_nram = (impl != NULL) && (std::strcmp(impl, "tile_nram") == 0);
+    bool use_tile_nram_db = (impl != NULL) && (std::strcmp(impl, "tile_nram_db") == 0);
     bool use_tile_sram = (impl != NULL) && (std::strcmp(impl, "tile_sram") == 0);
+    bool use_tile_sram_db = (impl != NULL) && (std::strcmp(impl, "tile_sram_db") == 0);
 
     if (use_baseline) {
         mlu_sgemv_kernel_baseline<<<k_dim, k_type, queue>>>(
@@ -652,8 +920,16 @@ extern "C" void mlu_BLAS_sGEMV(
         mlu_sgemv_kernel_tile_nram<<<k_dim, k_type, queue>>>(
             trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
         );
+    } else if (use_tile_nram_db) {
+        mlu_sgemv_kernel_tile_nram_db<<<k_dim, k_type, queue>>>(
+            trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
+        );
     } else if (use_tile_sram) {
         mlu_sgemv_kernel_tile_sram<<<k_dim, k_type, queue>>>(
+            trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
+        );
+    } else if (use_tile_sram_db) {
+        mlu_sgemv_kernel_tile_sram_db<<<k_dim, k_type, queue>>>(
             trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
         );
     } else {
