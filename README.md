@@ -199,6 +199,23 @@ blas_style ...
 
 `gemv_speedup_details.csv` 是逐 case 细节。单轮分析中包含每个实现的耗时、带宽、正确性和相对 baseline 的加速比；平均分析中包含 `avg_time_ms`、`time_stdev_ms`、`avg_bandwidth_kbs`、`pass_count` 和基于平均耗时计算的加速比。写实验表格时建议优先使用 `analysis_avg/gemv_speedup_details.csv`。
 
+### 当前实验结果
+
+当前 `build/perf_baseline_nram_sram/analysis_avg/gemv_speedup_summary.md` 使用 33 个测试样例、重复 3 次取平均，结果如下：
+
+| 实现 | 正确性 | 几何平均加速比 | p50 | p90 | 最小值 | 最大值 |
+|---|---:|---:|---:|---:|---:|---:|
+| `baseline` | 33/33 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| `tile_nram` | 33/33 | 8.4158 | 5.0523 | 81.6053 | 0.7895 | 81.7812 |
+| `tile_nram_db` | 33/33 | 9.3350 | 4.8202 | 145.4371 | 0.7143 | 154.0294 |
+| `tile_sram` | 33/33 | 10.1134 | 5.6831 | 101.4254 | 0.6000 | 122.0473 |
+| `tile_sram_db` | 33/33 | 10.1928 | 5.6344 | 110.3677 | 0.5556 | 129.8055 |
+| `blas_style` | 33/33 | 9.6996 | 5.3419 | 105.1551 | 0.5000 | 129.0708 |
+
+从这组数据看，`tile_sram_db` 是当前综合性能最好的实现，几何平均加速比为 `10.1928x`。`tile_sram` 已经达到 `10.1134x`，说明 `GDRAM -> SRAM -> NRAM` 的分块路径是主要收益来源；`tile_sram_db` 只比 `tile_sram` 略高，说明继续只优化 A 的 `GDRAM -> SRAM` 搬运收益有限。`blas_style` 使用更显式的 prologue / steady-state / epilogue 流水结构，但几何平均为 `9.6996x`，比 `tile_sram_db` 慢约 `5.1%`，主要原因是额外同步和控制流开销抵消了流水结构收益。
+
+按步长分组看，`incx=1,incy=1` 时 `tile_sram_db` 几何平均为 `14.4198x`，而 `incx=3,incy=2` 时下降到 `7.0503x`。这说明非单位步长 x 的 gather 仍然是后续优化重点。
+
 ### 双缓冲收益判断
 
 双缓冲的收益需要结合 `tile_nram` 和 `tile_sram` 的基线分别判断，而不是只看相对 baseline 的加速比。推荐在 `gemv_speedup_details.csv` 中计算：
@@ -255,8 +272,6 @@ python3 autotuner/analyze_gemv_logs.py \
 - `SRAM_BLOCK_ROWS`：旧默认优化版 kernel 的 SRAM 行分块大小，当前 `blas_style` 不使用。
 - `PIPELINE_BUFFERS`：旧默认优化版 kernel 的流水缓冲数量，当前 `blas_style` 不使用。
 - `UNROLL_FACTOR`：`tile_sram_db` 和 `blas_style` kernel 的尾部标量累加展开因子。
-
-当前阶段建议先保持 `UNROLL_FACTOR=1`，也就是不做尾部循环展开，把 `tile_sram_db`、`blas_style` 和前面分阶段实现先放在同一基准下比较。循环展开可以后续单独设置 `UNROLL_FACTOR=2/4` 再跑一组对比，避免把“分块/流水收益”和“循环展开收益”混在一起。
 
 修改这些参数后需要重新编译：
 
