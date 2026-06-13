@@ -30,6 +30,7 @@ if(HAVE_MLU)
     message(STATUS "Building GEMV with MLU (Cambricon) support")
     set(NEUWARE_HOME "/usr/local/neuware" CACHE PATH "Cambricon Neuware installation path")
     set(MLU_ARCH 270 CACHE STRING "MLU target architecture, for example 270 or 592")
+    set(GEMV_UNROLL_FACTOR 1 CACHE STRING "Tail scalar accumulation unroll factor for MLU GEMV kernels")
     set(CNCC_COMPILER "${NEUWARE_HOME}/bin/cncc" CACHE FILEPATH "Path to cncc compiler")
 
     message(STATUS "Using MLU architecture: mtp_${MLU_ARCH}")
@@ -55,6 +56,7 @@ if(HAVE_MLU)
                 -I${CMAKE_CURRENT_SOURCE_DIR}/include
                 -I${NEUWARE_HOME}/include
                 --bang-mlu-arch=mtp_${MLU_ARCH}
+                -DUNROLL_FACTOR=${GEMV_UNROLL_FACTOR}
                 -O2
             DEPENDS ${kernel}
             COMMENT "Compiling MLU kernel ${kernel_rel_path} with cncc"

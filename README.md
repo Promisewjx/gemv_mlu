@@ -118,7 +118,7 @@ cd /home/LCUDA/wjx/gemv_mlu
 
 ./autotuner/run_gemv_perf_compare.sh \
   --repeat 3 \
-  --out-dir build/perf_baseline_nram_sram
+  --out-dir build/perf
 ```
 
 脚本会执行：
@@ -254,15 +254,24 @@ python3 autotuner/analyze_gemv_logs.py \
 - `TILE_SRAM_BLOCK_ROWS`：`tile_sram` 的 SRAM 行分块大小，当前默认 `16`。
 - `SRAM_BLOCK_ROWS`：旧默认优化版 kernel 的 SRAM 行分块大小，当前 `blas_style` 不使用。
 - `PIPELINE_BUFFERS`：旧默认优化版 kernel 的流水缓冲数量，当前 `blas_style` 不使用。
-- `UNROLL_FACTOR`：`blas_style` kernel 的尾部标量累加展开因子。
+- `UNROLL_FACTOR`：`tile_sram_db` 和 `blas_style` kernel 的尾部标量累加展开因子。
 
-当前阶段建议先保持 `UNROLL_FACTOR=1`，也就是不做尾部循环展开，把 `blas_style` kernel 和前面分阶段实现先放在同一基准下比较。循环展开可以后续单独设置 `UNROLL_FACTOR=2/4` 再跑一组对比，避免把“BLAS 风格流水收益”和“循环展开收益”混在一起。
+当前阶段建议先保持 `UNROLL_FACTOR=1`，也就是不做尾部循环展开，把 `tile_sram_db`、`blas_style` 和前面分阶段实现先放在同一基准下比较。循环展开可以后续单独设置 `UNROLL_FACTOR=2/4` 再跑一组对比，避免把“分块/流水收益”和“循环展开收益”混在一起。
 
 修改这些参数后需要重新编译：
 
 ```bash
 cd /home/LCUDA/wjx/gemv_mlu/build
 make -j
+```
+
+例如测试 `tile_sram_db` 的尾部标量循环展开：
+
+```bash
+cd /home/LCUDA/wjx/gemv_mlu/build
+cmake .. -DGEMV_UNROLL_FACTOR=4
+make -j
+GEMV_IMPL=tile_sram_db ./test/test_gemv
 ```
 
 ## 自适应调优

@@ -515,7 +515,21 @@ __mlu_entry__ void mlu_sgemv_kernel_tile_sram_db(
                     }
                 }
 
-                for (int k = aligned; k < block_size; ++k) {
+                int k = aligned;
+                #if UNROLL_FACTOR == 4
+                    for (; k < block_size - 3; k += 4) {
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                        dot_product += nram_A_row[k + 2] * nram_x_block[k + 2];
+                        dot_product += nram_A_row[k + 3] * nram_x_block[k + 3];
+                    }
+                #elif UNROLL_FACTOR == 2
+                    for (; k < block_size - 1; k += 2) {
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                    }
+                #endif
+                for (; k < block_size; ++k) {
                     dot_product += nram_A_row[k] * nram_x_block[k];
                 }
 
