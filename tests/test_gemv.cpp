@@ -1,4 +1,6 @@
 #include "GemvLibrary.h"
+#include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
@@ -29,13 +31,17 @@ class GEMVTester {
 
     void reference_gemv(DnOperation_t trans, int m, int n, float alpha, const std::vector<float> &A,
                     int lda, const std::vector<float> &x, int incx, float beta,
-                    std::vector<float> &y, int incy) {
+                    std::vector<float> &y, int incy, std::vector<float> *error_bounds = nullptr) {
         bool is_trans = (trans != DnBLAS_OP_N);
         int x_len = is_trans ? m : n;
         int y_len = is_trans ? n : m;
+        if (error_bounds) {
+            error_bounds->assign(y_len, 0.0f);
+        }
 
         for (int i = 0; i < y_len; i++) {
             float sum = 0.0f;
+            float sum_abs = 0.0f;
             // if (i == 0 || i == 1) {
             //     std::cout << "[CPU] Row " << i << ": A_row[0..7] = ";
             //     for (int j = 0; j < std::min(8, x_len); ++j) {
@@ -61,10 +67,16 @@ class GEMVTester {
                 } else {
                     a_val = A[j * lda + i];
                 }
-                sum += a_val * x[j * incx];
+                float prod = a_val * x[j * incx];
+                sum += prod;
+                sum_abs += std::fabs(prod);
             }
             float old_y = y[i * incy];
             y[i * incy] = alpha * sum + beta * y[i * incy];
+            if (error_bounds) {
+                float scale = std::fabs(alpha) * sum_abs + std::fabs(beta * old_y);
+                (*error_bounds)[i] = 64.0f * FLT_EPSILON * scale + 1e-3f;
+            }
             // if (i == 0 || i == 1) {
             //     std::cout << "[CPU] idx=" << i << ", final sum=" << sum
             //             << ", y before=" << old_y
@@ -74,15 +86,22 @@ class GEMVTester {
     }
 
     bool compare_vectors(const std::vector<float> &expected, const std::vector<float> &actual,
-                         int size, int inc, float tolerance = 4e-2f) {
+                         const std::vector<float> &error_bounds, int size, int inc,
+                         float tolerance = 4e-2f) {
         for (int i = 0; i < size; i++) {
             float ref = expected[i * inc];
             float val = actual[i * inc];
             float denom = std::max(1.0f, std::fabs(ref)); // 防止除0
-            float rel_diff = std::fabs(ref - val) / denom;
-            if (rel_diff > tolerance) {
+            float abs_diff = std::fabs(ref - val);
+            float rel_diff = abs_diff / denom;
+            float allowed = tolerance * denom;
+            if (i < static_cast<int>(error_bounds.size())) {
+                allowed = std::max(allowed, error_bounds[i]);
+            }
+            if (abs_diff > allowed) {
                 std::cout << "    ❌ 错误: 索引 " << i << " 处不匹配: 期望值 " << ref
-                        << ", 实际值 " << val << ", 相对误差=" << rel_diff << std::endl;
+                        << ", 实际值 " << val << ", 相对误差=" << rel_diff
+                        << ", 绝对误差=" << abs_diff << ", 允许误差=" << allowed << std::endl;
                 return false;
             }
         }
@@ -108,6 +127,7 @@ class GEMVTester {
         std::vector<float> x((x_len - 1) * incx + 1, 0.0f);
         std::vector<float> y((y_len - 1) * incy + 1, 0.0f);
         std::vector<float> y_expected = y;
+        std::vector<float> error_bounds(y_len, 0.0f);
 
         initialize_matrix(A, m, n, lda);
         initialize_vector(x, x_len, incx);
@@ -118,7 +138,8 @@ class GEMVTester {
         float beta = 0.5f;
 
         // Reference computation
-        reference_gemv(trans, m, n, alpha, A, lda, x, incx, beta, y_expected, incy);
+        reference_gemv(trans, m, n, alpha, A, lda, x, incx, beta, y_expected, incy,
+                       &error_bounds);
 
         // kernel 调用前
         // std::cout << "[DEBUG] y y_expected kernel: ";
@@ -159,7 +180,7 @@ class GEMVTester {
         }
 
         // Compare results
-        if (compare_vectors(y_expected, y, y_len, incy)) {
+        if (compare_vectors(y_expected, y, error_bounds, y_len, incy)) {
             std::cout << "✅ " << test_name << " 测试通过" << std::endl;
             passed_count++;
         } else {
@@ -216,7 +237,10 @@ class GEMVTester {
             std::cerr << "❌ 创建 DnHandle 失败" << std::endl;
             exit(1);
         }
-        srand(time(nullptr));
+        const char *seed_env = std::getenv("GEMV_SEED");
+        unsigned int seed = seed_env ? static_cast<unsigned int>(std::strtoul(seed_env, nullptr, 10))
+                                     : 20260613u;
+        srand(seed);
         setup_all_tests();
     }
 

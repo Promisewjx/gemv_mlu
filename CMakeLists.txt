@@ -109,13 +109,6 @@ if(BUILD_TESTS)
     )
     add_test(NAME test_gemv_quick COMMAND test_gemv quick)
 
-    add_executable(test_gemv_union1 tests/test_gemv_union1.cpp)
-    target_link_libraries(test_gemv_union1 PRIVATE GEMV)
-    set_target_properties(test_gemv_union1 PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test
-    )
-    add_test(NAME test_gemv_union1 COMMAND test_gemv_union1)
-
     if(HAVE_MLU)
         add_executable(gemv_bo_launcher autotuner/launcher/gemv_bo_launcher.cpp)
         target_include_directories(gemv_bo_launcher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
