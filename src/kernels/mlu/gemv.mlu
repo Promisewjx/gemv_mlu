@@ -537,43 +537,26 @@ __mlu_entry__ void mlu_sgemv_kernel_tile_sram_db(
     }
 }
 
-__mlu_entry__ void mlu_sgemv_kernel(
+__mlu_entry__ void mlu_sgemv_kernel_blas_style(
     char trans, int m, int n, const float alpha, const float *A, int lda,
     const float *x, int incx, const float beta, float *y, int incy
 ) {
-    // === 获取 Kernel 调度和任务分配相关的 ID 和维度 ===
-    int total_logic_cores = taskDim;
-    int tid = taskId;
-
     const int cores_per_cluster_config = coreDim;
     const int clusters_config = taskDimY;
 
     size_t logic_cluster_id = taskIdY; 
     size_t logic_core_id_in_cluster = coreId;
-    size_t align_num = BINARY_ALIGN_NUM;
 
     bool is_trans = (trans == 'T' || trans == 'C');
     int y_len = is_trans ? n : m; 
     int x_len = is_trans ? m : n; 
 
-    // --- SRAM 内存分配 (Cluster 共享) ---
-    __mlu_shared__ int8_t sram_buffer[MAX_SRAM_SIZE];
-    const size_t sram_size_per_logic_cluster = MAX_SRAM_SIZE; 
-    const size_t sram_size_per_buffer = sram_size_per_logic_cluster / PIPELINE_BUFFERS;
-    float *sram_A_ping = (float*)(sram_buffer);
-    // float *sram_A_pong = (float*)(sram_buffer + sram_size_per_logic_cluster / 2);
-    float *sram_A_pong = (PIPELINE_BUFFERS > 1) ? (float*)(sram_buffer + sram_size_per_buffer) : sram_A_ping;
-
-
-    // --- NRAM 内存分配 (Core 私有) ---
-    __nram__ int8_t nram_buffer[MAX_NRAM_SIZE];
-    const int nram_float_capacity = MAX_NRAM_SIZE / sizeof(float);
-    // const int nram_chunk_size = nram_float_capacity / 3; 
     const int nram_chunk_size = NRAM_CHUNK_FLOATS;
-
-    float *nram_x_block = (float*)nram_buffer;
-    float *nram_A_row = nram_x_block + nram_chunk_size;
-    float *nram_sum = nram_A_row + nram_chunk_size;
+    __mlu_shared__ float sram_A_ping[TILE_SRAM_BLOCK_ROWS][NRAM_CHUNK_FLOATS];
+    __mlu_shared__ float sram_A_pong[TILE_SRAM_BLOCK_ROWS][NRAM_CHUNK_FLOATS];
+    __nram__ float nram_x_block[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_A_row[NRAM_CHUNK_FLOATS];
+    __nram__ float nram_sum[NRAM_CHUNK_FLOATS];
 
     // === 基于逻辑 Cluster 进行任务分配 ===
     size_t rows_per_logic_cluster = (size_t)y_len / clusters_config; 
@@ -587,306 +570,225 @@ __mlu_entry__ void mlu_sgemv_kernel(
     int cluster_global_end_row = cluster_global_start_row + (int)rows_per_logic_cluster;
 
     if (cluster_global_start_row >= cluster_global_end_row) {
-        __sync_cluster();
         return;
     }
 
-    // === Core 在逻辑 Cluster 内的任务分配 ===
-    size_t rows_per_logic_core_in_cluster = (rows_per_logic_cluster + cores_per_cluster_config - 1) / cores_per_cluster_config;
-    size_t core_start_row = logic_core_id_in_cluster * rows_per_logic_core_in_cluster;
-    size_t core_end_row = MIN(core_start_row + rows_per_logic_core_in_cluster, rows_per_logic_cluster);
-
-    int core_global_start_row = cluster_global_start_row + (int)core_start_row;
-    int core_global_end_row = cluster_global_start_row + (int)core_end_row;
-
-    // --- 分块搬运A到SRAM并计算（五级流水线，Ping-Pong，repeat方式） ---
-    // int max_rows_per_sram_block = (sram_size_per_logic_cluster / 2) / (lda * sizeof(float));
-    int max_possible_rows = (sram_size_per_logic_cluster / 2) / (lda * sizeof(float));
-    if (max_possible_rows == 0) max_possible_rows = 1; // 至少处理一行
-
-    // 2. 取理论最大值和我们传入的参数之间的较小者
-    const int max_rows_per_sram_block = MIN(SRAM_BLOCK_ROWS, max_possible_rows);
-    // const int max_rows_per_sram_block = SRAM_BLOCK_ROWS;
     int total_rows = (int)rows_per_logic_cluster;
-    int repeat = total_rows / max_rows_per_sram_block;
-    int remain_rows = total_rows % max_rows_per_sram_block;
+    for (int block_offset = 0; block_offset < total_rows; block_offset += TILE_SRAM_BLOCK_ROWS) {
+        int rows_in_block = MIN(TILE_SRAM_BLOCK_ROWS, total_rows - block_offset);
 
-    // 预取第一块
-    if (repeat > 0) {
-        __memcpy_async(sram_A_ping, 
-            A + (cluster_global_start_row + 0) * lda, 
-            max_rows_per_sram_block * lda * sizeof(float), 
-            GDRAM2SRAM);
-        __sync_cluster();
-    }
-    if (repeat > 1) {
-        // 1. 预取第二块A到pong区
-        __memcpy_async(sram_A_pong, 
-            A + (cluster_global_start_row + max_rows_per_sram_block) * lda, 
-            max_rows_per_sram_block * lda * sizeof(float), 
-            GDRAM2SRAM);
-        
-        // 2. 处理第一块A（ping区）：搬到NRAM、计算、写回SRAM
-        int block_row_start = MAX(core_global_start_row, cluster_global_start_row + 0);
-        int block_row_end = MIN(core_global_end_row, cluster_global_start_row + max_rows_per_sram_block);
-        __nram__ float dot_product_nram = 0.0f;
-        for (int row = block_row_start; row < block_row_end; row++) {
-            int offset_in_sram = (row - cluster_global_start_row) * lda;
-            
-            for (int x_start = 0; x_start < x_len; x_start += nram_chunk_size) {
-                int block_size = MIN(nram_chunk_size, x_len - x_start);
-                __memcpy(nram_A_row, sram_A_ping + offset_in_sram + x_start, block_size * sizeof(float), SRAM2NRAM);
-                if (incx == 1) {
-                    __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
-                } else {
-                    for (int k = 0; k < block_size; ++k) {
-                        __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
-                    }
+        size_t rows_per_core_in_block =
+            (rows_in_block + cores_per_cluster_config - 1) / cores_per_cluster_config;
+        size_t core_block_start = logic_core_id_in_cluster * rows_per_core_in_block;
+        size_t core_block_end =
+            MIN(core_block_start + rows_per_core_in_block, (size_t)rows_in_block);
+
+        float dot_values[TILE_SRAM_BLOCK_ROWS];
+        for (int r = 0; r < TILE_SRAM_BLOCK_ROWS; ++r) {
+            dot_values[r] = 0.0f;
+        }
+
+        int tile_count = (x_len + nram_chunk_size - 1) / nram_chunk_size;
+
+        // 预取第一块 A tile 到 ping 区。
+        if (tile_count > 0) {
+            int first_size = MIN(nram_chunk_size, x_len);
+            for (int r = 0; r < rows_in_block; ++r) {
+                __memcpy_async(
+                    sram_A_ping[r],
+                    A + (cluster_global_start_row + block_offset + r) * lda,
+                    first_size * sizeof(float),
+                    GDRAM2SRAM);
+            }
+            __sync_all();
+        }
+
+        if (tile_count > 1) {
+            // 预取第二块 A tile，同时计算第一块。
+            int next_start = nram_chunk_size;
+            int next_size = MIN(nram_chunk_size, x_len - next_start);
+            for (int r = 0; r < rows_in_block; ++r) {
+                __memcpy_async(
+                    sram_A_pong[r],
+                    A + (cluster_global_start_row + block_offset + r) * lda + next_start,
+                    next_size * sizeof(float),
+                    GDRAM2SRAM);
+            }
+
+            int x_start = 0;
+            int block_size = MIN(nram_chunk_size, x_len - x_start);
+            if (incx == 1) {
+                __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
+            } else {
+                for (int k = 0; k < block_size; ++k) {
+                    __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
                 }
+            }
+            __sync_copy_dram_to_nram();
+
+            for (int row_in_block = (int)core_block_start; row_in_block < (int)core_block_end;
+                    ++row_in_block) {
+                __memcpy(nram_A_row, sram_A_ping[row_in_block], block_size * sizeof(float), SRAM2NRAM);
+                __sync_copy_sram_to_nram();
+
+                float dot_product = 0.0f;
                 int aligned = (block_size / 64) * 64;
                 if (aligned > 0) {
                     __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
                     __bang_reduce_sum(nram_sum, nram_A_row, aligned);
                     for (int k = 0; k < aligned; k += 32) {
-                        dot_product_nram += nram_sum[k];
+                        dot_product += nram_sum[k];
                     }
                 }
                 int k = aligned;
                 #if UNROLL_FACTOR == 4
                     for (; k < block_size - 3; k += 4) {
-                        dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                        dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                        dot_product_nram += nram_A_row[k+2] * nram_x_block[k+2];
-                        dot_product_nram += nram_A_row[k+3] * nram_x_block[k+3];
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                        dot_product += nram_A_row[k + 2] * nram_x_block[k + 2];
+                        dot_product += nram_A_row[k + 3] * nram_x_block[k + 3];
                     }
                 #elif UNROLL_FACTOR == 2
                     for (; k < block_size - 1; k += 2) {
-                        dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                        dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
                     }
                 #endif
-                
-                // 处理剩余的、不足一个展开单位的元素
                 for (; k < block_size; ++k) {
-                    dot_product_nram += nram_A_row[k] * nram_x_block[k];
+                    dot_product += nram_A_row[k] * nram_x_block[k];
+                }
+                dot_values[row_in_block] += dot_product;
+            }
+            __sync_all();
+        }
+
+        for (int i = 0; i < tile_count - 2; ++i) {
+            // 预取第 i+2 块 A tile，同时计算第 i+1 块。
+            int prefetch_tile = i + 2;
+            int prefetch_start = prefetch_tile * nram_chunk_size;
+            int prefetch_size = MIN(nram_chunk_size, x_len - prefetch_start);
+            float (*pre_sram)[NRAM_CHUNK_FLOATS] =
+                ((prefetch_tile & 1) == 0) ? sram_A_ping : sram_A_pong;
+            for (int r = 0; r < rows_in_block; ++r) {
+                __memcpy_async(
+                    pre_sram[r],
+                    A + (cluster_global_start_row + block_offset + r) * lda + prefetch_start,
+                    prefetch_size * sizeof(float),
+                    GDRAM2SRAM);
+            }
+
+            int compute_tile = i + 1;
+            int x_start = compute_tile * nram_chunk_size;
+            int block_size = MIN(nram_chunk_size, x_len - x_start);
+            float (*cur_sram)[NRAM_CHUNK_FLOATS] =
+                ((compute_tile & 1) == 0) ? sram_A_ping : sram_A_pong;
+
+            if (incx == 1) {
+                __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
+            } else {
+                for (int k = 0; k < block_size; ++k) {
+                    __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
                 }
             }
+            __sync_copy_dram_to_nram();
+
+            for (int row_in_block = (int)core_block_start; row_in_block < (int)core_block_end;
+                    ++row_in_block) {
+                __memcpy(nram_A_row, cur_sram[row_in_block], block_size * sizeof(float), SRAM2NRAM);
+                __sync_copy_sram_to_nram();
+
+                float dot_product = 0.0f;
+                int aligned = (block_size / 64) * 64;
+                if (aligned > 0) {
+                    __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
+                    __bang_reduce_sum(nram_sum, nram_A_row, aligned);
+                    for (int k = 0; k < aligned; k += 32) {
+                        dot_product += nram_sum[k];
+                    }
+                }
+                int k = aligned;
+                #if UNROLL_FACTOR == 4
+                    for (; k < block_size - 3; k += 4) {
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                        dot_product += nram_A_row[k + 2] * nram_x_block[k + 2];
+                        dot_product += nram_A_row[k + 3] * nram_x_block[k + 3];
+                    }
+                #elif UNROLL_FACTOR == 2
+                    for (; k < block_size - 1; k += 2) {
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                    }
+                #endif
+                for (; k < block_size; ++k) {
+                    dot_product += nram_A_row[k] * nram_x_block[k];
+                }
+                dot_values[row_in_block] += dot_product;
+            }
+            __sync_all();
+        }
+
+        if (tile_count > 0) {
+            // 计算最后一块 A tile。若只有一个 tile，这里直接计算第一块。
+            int compute_tile = tile_count - 1;
+            int x_start = compute_tile * nram_chunk_size;
+            int block_size = MIN(nram_chunk_size, x_len - x_start);
+            float (*cur_sram)[NRAM_CHUNK_FLOATS] =
+                ((compute_tile & 1) == 0) ? sram_A_ping : sram_A_pong;
+
+            if (incx == 1) {
+                __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
+            } else {
+                for (int k = 0; k < block_size; ++k) {
+                    __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
+                }
+            }
+            __sync_copy_dram_to_nram();
+
+            for (int row_in_block = (int)core_block_start; row_in_block < (int)core_block_end;
+                    ++row_in_block) {
+                __memcpy(nram_A_row, cur_sram[row_in_block], block_size * sizeof(float), SRAM2NRAM);
+                __sync_copy_sram_to_nram();
+
+                float dot_product = 0.0f;
+                int aligned = (block_size / 64) * 64;
+                if (aligned > 0) {
+                    __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
+                    __bang_reduce_sum(nram_sum, nram_A_row, aligned);
+                    for (int k = 0; k < aligned; k += 32) {
+                        dot_product += nram_sum[k];
+                    }
+                }
+                int k = aligned;
+                #if UNROLL_FACTOR == 4
+                    for (; k < block_size - 3; k += 4) {
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                        dot_product += nram_A_row[k + 2] * nram_x_block[k + 2];
+                        dot_product += nram_A_row[k + 3] * nram_x_block[k + 3];
+                    }
+                #elif UNROLL_FACTOR == 2
+                    for (; k < block_size - 1; k += 2) {
+                        dot_product += nram_A_row[k] * nram_x_block[k];
+                        dot_product += nram_A_row[k + 1] * nram_x_block[k + 1];
+                    }
+                #endif
+                for (; k < block_size; ++k) {
+                    dot_product += nram_A_row[k] * nram_x_block[k];
+                }
+                dot_values[row_in_block] += dot_product;
+            }
+            __sync_all();
+        }
+
+        for (int row_in_block = (int)core_block_start; row_in_block < (int)core_block_end;
+                ++row_in_block) {
+            int row = cluster_global_start_row + block_offset + row_in_block;
             __nram__ float nram_y_val;
             __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
-            nram_y_val = alpha * dot_product_nram + beta * nram_y_val;
+            __sync_copy_dram_to_nram();
+            nram_y_val = alpha * dot_values[row_in_block] + beta * nram_y_val;
             __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
-            dot_product_nram = 0.0f;
-        }
-        __sync_cluster();
-    }
-
-    for (int i = 0; i < repeat - 2; ++i) {
-        // 预取第 i+2 块 A 到 ping/pong 区
-        float *pre_sram = ((i % 2) == 0) ? sram_A_ping : sram_A_pong;
-        __memcpy_async(pre_sram,
-            A + (cluster_global_start_row + (i + 2) * max_rows_per_sram_block) * lda,
-            max_rows_per_sram_block * lda * sizeof(float), GDRAM2SRAM);
-        
-        __sync_cluster();
-
-        // 计算第 i+1 块（搬运到NRAM，计算，写回SRAM）
-        float *cur_sram = ((i + 1) % 2 == 0) ? sram_A_ping : sram_A_pong;
-        int block_offset = (i + 1) * max_rows_per_sram_block;
-        int block_row_start = MAX(core_global_start_row, cluster_global_start_row + block_offset);
-        int block_row_end = MIN(core_global_end_row, cluster_global_start_row + block_offset + max_rows_per_sram_block);
-
-        __nram__ float dot_product_nram = 0.0f;
-        if (block_row_start < block_row_end) {
-            for (int row = block_row_start; row < block_row_end; row++) {
-                int offset_in_sram = (row - (cluster_global_start_row + block_offset)) * lda;
-                
-                for (int x_start = 0; x_start < x_len; x_start += nram_chunk_size) {
-                    int block_size = MIN(nram_chunk_size, x_len - x_start);
-                    __memcpy(nram_A_row, cur_sram + offset_in_sram + x_start, block_size * sizeof(float), SRAM2NRAM);
-                    if (incx == 1) {
-                        __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
-                    } else {
-                        for (int k = 0; k < block_size; ++k) {
-                            __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
-                        }
-                    }
-                    int aligned = (block_size / 64) * 64;
-                    if (aligned > 0) {
-                        __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
-                        __bang_reduce_sum(nram_sum, nram_A_row, aligned);
-                        for (int k = 0; k < aligned; k += 32) {
-                            dot_product_nram += nram_sum[k];
-                        }
-                    }
-                    int k = aligned;
-                    #if UNROLL_FACTOR == 4
-                        for (; k < block_size - 3; k += 4) {
-                            dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                            dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                            dot_product_nram += nram_A_row[k+2] * nram_x_block[k+2];
-                            dot_product_nram += nram_A_row[k+3] * nram_x_block[k+3];
-                        }
-                    #elif UNROLL_FACTOR == 2
-                        for (; k < block_size - 1; k += 2) {
-                            dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                            dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                        }
-                    #endif
-                    
-                    // 处理剩余的、不足一个展开单位的元素
-                    for (; k < block_size; ++k) {
-                        dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                    }
-                }
-                __nram__ float nram_y_val;
-                __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
-                // if(row == 244 || row == 245)
-                //     printf("[DEBUG] row=%d, y_before: %.6f, y_after: %.6f\n", row, nram_y_val, alpha * dot_product_nram + beta * nram_y_val);
-                nram_y_val = alpha * dot_product_nram + beta * nram_y_val;
-                __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
-                dot_product_nram = 0.0f;
-            }
-        }
-        __sync_cluster();
-    }
-
-    if (remain_rows > 0) {
-        // 预取剩余不足一块的A
-        float *cur_sram = ((repeat % 2) == 0) ? sram_A_ping : sram_A_pong;
-        int block_offset = repeat * max_rows_per_sram_block;
-        int A_block_bytes = remain_rows * lda * sizeof(float);
-
-        __memcpy_async(cur_sram,
-            A + (cluster_global_start_row + block_offset) * lda,
-            A_block_bytes, GDRAM2SRAM);
-        __sync_cluster();
-    }
-
-    if (repeat > 0) {
-        // 计算并写回最后一块
-        float *cur_sram = ((repeat - 1) % 2 == 0) ? sram_A_ping : sram_A_pong;
-        int block_offset = (repeat - 1) * max_rows_per_sram_block;
-        int block_row_start = MAX(core_global_start_row, cluster_global_start_row + block_offset);
-        int block_row_end = MIN(core_global_end_row, cluster_global_start_row + block_offset + max_rows_per_sram_block);
-
-        __nram__ float dot_product_nram = 0.0f;
-        if (block_row_start < block_row_end) {
-            for (int row = block_row_start; row < block_row_end; row++) {
-                int offset_in_sram = (row - (cluster_global_start_row + block_offset)) * lda;
-                
-                for (int x_start = 0; x_start < x_len; x_start += nram_chunk_size) {
-                    int block_size = MIN(nram_chunk_size, x_len - x_start);
-                    __memcpy(nram_A_row, cur_sram + offset_in_sram + x_start, block_size * sizeof(float), SRAM2NRAM);
-                    if (incx == 1) {
-                        __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
-                    } else {
-                        for (int k = 0; k < block_size; ++k) {
-                            __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
-                        }
-                    }
-                    int aligned = (block_size / 64) * 64;
-                    if (aligned > 0) {
-                        __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
-                        __bang_reduce_sum(nram_sum, nram_A_row, aligned);
-                        for (int k = 0; k < aligned; k += 32) {
-                            dot_product_nram += nram_sum[k];
-                        }
-                    }
-                    int k = aligned;
-                    #if UNROLL_FACTOR == 4
-                        for (; k < block_size - 3; k += 4) {
-                            dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                            dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                            dot_product_nram += nram_A_row[k+2] * nram_x_block[k+2];
-                            dot_product_nram += nram_A_row[k+3] * nram_x_block[k+3];
-                        }
-                    #elif UNROLL_FACTOR == 2
-                        for (; k < block_size - 1; k += 2) {
-                            dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                            dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                        }
-                    #endif
-                    
-                    // 处理剩余的、不足一个展开单位的元素
-                    for (; k < block_size; ++k) {
-                        dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                    }
-                }
-                __nram__ float nram_y_val;
-                __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
-                nram_y_val = alpha * dot_product_nram + beta * nram_y_val;
-                __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
-                dot_product_nram = 0.0f;
-            }
-        }
-        __sync_cluster();
-
-    }
-
-    // --- 处理剩余不足一块的行 ---
-    if (remain_rows > 0) {
-        float *cur_sram = (repeat % 2 == 0) ? sram_A_ping : sram_A_pong;
-        int block_offset = repeat * max_rows_per_sram_block;
-        int A_block_bytes = remain_rows * lda * sizeof(float);
-
-        __memcpy_async(cur_sram, 
-            A + (cluster_global_start_row + block_offset) * lda, 
-            A_block_bytes, 
-            GDRAM2SRAM);
-        __sync_cluster();
-
-        int block_row_start = MAX(core_global_start_row, cluster_global_start_row + block_offset);
-        int block_row_end = MIN(core_global_end_row, cluster_global_start_row + block_offset + remain_rows);
-
-        __nram__ float dot_product_nram = 0.0f;
-        if (block_row_start < block_row_end) {
-            for (int row = block_row_start; row < block_row_end; row++) {
-                int offset_in_sram = (row - (cluster_global_start_row + block_offset)) * lda;
-                
-                for (int x_start = 0; x_start < x_len; x_start += nram_chunk_size) {
-                    int block_size = MIN(nram_chunk_size, x_len - x_start);
-                    __memcpy(nram_A_row, cur_sram + offset_in_sram + x_start, block_size * sizeof(float), SRAM2NRAM);
-                    if (incx == 1) {
-                        __memcpy(nram_x_block, x + (x_start * incx), block_size * sizeof(float), GDRAM2NRAM);
-                    } else {
-                        for (int k = 0; k < block_size; ++k) {
-                            __memcpy(&nram_x_block[k], x + (x_start + k) * incx, sizeof(float), GDRAM2NRAM);
-                        }
-                    }
-                    int aligned = (block_size / 64) * 64;
-                    if (aligned > 0) {
-                        __bang_mul(nram_A_row, nram_A_row, nram_x_block, aligned);
-                        __bang_reduce_sum(nram_sum, nram_A_row, aligned);
-                        for (int k = 0; k < aligned; k += 32) {
-                            dot_product_nram += nram_sum[k];
-                        }
-                    }
-                    int k = aligned;
-                    #if UNROLL_FACTOR == 4
-                        for (; k < block_size - 3; k += 4) {
-                            dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                            dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                            dot_product_nram += nram_A_row[k+2] * nram_x_block[k+2];
-                            dot_product_nram += nram_A_row[k+3] * nram_x_block[k+3];
-                        }
-                    #elif UNROLL_FACTOR == 2
-                        for (; k < block_size - 1; k += 2) {
-                            dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                            dot_product_nram += nram_A_row[k+1] * nram_x_block[k+1];
-                        }
-                    #endif
-                    
-                    // 处理剩余的、不足一个展开单位的元素
-                    for (; k < block_size; ++k) {
-                        dot_product_nram += nram_A_row[k] * nram_x_block[k];
-                    }
-                }
-                __nram__ float nram_y_val;
-                __memcpy(&nram_y_val, y + row * incy, sizeof(float), GDRAM2NRAM);
-                nram_y_val = alpha * dot_product_nram + beta * nram_y_val;
-                __memcpy(y + row * incy, &nram_y_val, sizeof(float), NRAM2GDRAM);
-                dot_product_nram = 0.0f;
-            }
         }
     }
 }
@@ -904,13 +806,14 @@ extern "C" void mlu_BLAS_sGEMV(
     k_dim.y = MLU_CLUSTER_NUM;
     k_dim.z = 1;
 
-    // Export GEMV_IMPL=baseline to run baseline kernel; default uses optimized kernel.
+    // Export GEMV_IMPL to select a kernel. Default uses the BLAS-style pipeline kernel.
     const char *impl = std::getenv("GEMV_IMPL");
     bool use_baseline = (impl != NULL) && (std::strcmp(impl, "baseline") == 0);
     bool use_tile_nram = (impl != NULL) && (std::strcmp(impl, "tile_nram") == 0);
     bool use_tile_nram_db = (impl != NULL) && (std::strcmp(impl, "tile_nram_db") == 0);
     bool use_tile_sram = (impl != NULL) && (std::strcmp(impl, "tile_sram") == 0);
     bool use_tile_sram_db = (impl != NULL) && (std::strcmp(impl, "tile_sram_db") == 0);
+    bool use_blas_style = (impl != NULL) && (std::strcmp(impl, "blas_style") == 0);
 
     if (use_baseline) {
         mlu_sgemv_kernel_baseline<<<k_dim, k_type, queue>>>(
@@ -932,8 +835,12 @@ extern "C" void mlu_BLAS_sGEMV(
         mlu_sgemv_kernel_tile_sram_db<<<k_dim, k_type, queue>>>(
             trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
         );
+    } else if (use_blas_style) {
+        mlu_sgemv_kernel_blas_style<<<k_dim, k_type, queue>>>(
+            trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
+        );
     } else {
-        mlu_sgemv_kernel<<<k_dim, k_type, queue>>>(
+        mlu_sgemv_kernel_blas_style<<<k_dim, k_type, queue>>>(
             trans, m, n, alpha, d_A, lda, d_x, incx, beta, d_y, incy
         );
     }

@@ -97,7 +97,7 @@ case "${MODE}" in
         ;;
 esac
 
-impls=("baseline" "tile_nram" "tile_nram_db" "tile_sram" "tile_sram_db")
+impls=("baseline" "tile_nram" "tile_nram_db" "tile_sram" "tile_sram_db" "blas_style")
 
 for ((round = 1; round <= REPEAT; ++round)); do
     round_logs=()

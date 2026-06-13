@@ -85,7 +85,10 @@ GEMV_IMPL=tile_sram ./test/test_gemv
 # 在 tile_sram 基础上加入 SRAM ping-pong 双缓冲
 GEMV_IMPL=tile_sram_db ./test/test_gemv
 
-# 不设置 GEMV_IMPL 时，使用默认优化版 kernel
+# BLAS 风格 prologue / steady-state / epilogue 流水实现
+GEMV_IMPL=blas_style ./test/test_gemv
+
+# 不设置 GEMV_IMPL 时也默认使用 blas_style
 ./test/test_gemv
 ```
 
@@ -97,6 +100,7 @@ GEMV_IMPL=tile_nram ./test/test_gemv single 9
 GEMV_IMPL=tile_nram_db ./test/test_gemv single 9
 GEMV_IMPL=tile_sram ./test/test_gemv single 15
 GEMV_IMPL=tile_sram_db ./test/test_gemv single 15
+GEMV_IMPL=blas_style ./test/test_gemv single 9
 ```
 
 如果需要更换测试数据：
@@ -107,7 +111,7 @@ GEMV_SEED=123 GEMV_IMPL=baseline ./test/test_gemv
 
 ## 性能对比
 
-推荐用脚本一次性测试 `baseline -> tile_nram -> tile_nram_db -> tile_sram -> tile_sram_db` 五个阶段，并自动生成日志和加速比表格：
+推荐用脚本一次性测试 `baseline -> tile_nram -> tile_nram_db -> tile_sram -> tile_sram_db -> blas_style` 六个阶段，并自动生成日志和加速比表格：
 
 ```bash
 cd /home/LCUDA/wjx/gemv_mlu
@@ -125,6 +129,7 @@ GEMV_IMPL=tile_nram
 GEMV_IMPL=tile_nram_db
 GEMV_IMPL=tile_sram
 GEMV_IMPL=tile_sram_db
+GEMV_IMPL=blas_style
 ```
 
 每轮都会生成独立日志和单轮分析结果；当 `--repeat > 1` 时，脚本还会额外生成三次平均后的最终分析结果：
@@ -136,7 +141,8 @@ build/perf_baseline_nram_sram/
 │   ├── tile_nram_r1.log
 │   ├── tile_nram_db_r1.log
 │   ├── tile_sram_r1.log
-│   └── tile_sram_db_r1.log
+│   ├── tile_sram_db_r1.log
+│   └── blas_style_r1.log
 ├── analysis_r1/
 │   ├── gemv_speedup_summary.md
 │   └── gemv_speedup_details.csv
@@ -177,6 +183,7 @@ tile_nram  gmean_speedup = 8.2936
 tile_nram_db ...
 tile_sram  gmean_speedup = 10.0467
 tile_sram_db ...
+blas_style ...
 ```
 
 表示其他实现的耗时相对 baseline 的加速倍数。`tile_nram_db` 和 `tile_sram_db` 用于观察在 NRAM/SRAM 分块基础上加入双缓冲后的收益。
@@ -217,6 +224,7 @@ python3 autotuner/analyze_gemv_logs.py \
   tile_nram_db=build/results/tile_nram_db.log \
   tile_sram=build/results/tile_sram.log \
   tile_sram_db=build/results/tile_sram_db.log \
+  blas_style=build/results/blas_style.log \
   --out-dir build/analysis
 ```
 
@@ -231,6 +239,7 @@ python3 autotuner/analyze_gemv_logs.py \
 - `tile_nram_db`：在 `tile_nram` 基础上加入 NRAM ping-pong 双缓冲，当前 tile 计算时预取下一个 tile。
 - `tile_sram`：按行块和列块分块，先将 A tile 从 GDRAM 搬到 SRAM，再由各 core 搬到 NRAM 计算，用于观察 `GDRAM -> SRAM -> NRAM` 数据路径的收益。
 - `tile_sram_db`：在 `tile_sram` 基础上加入 SRAM ping-pong 双缓冲，当前 A tile 计算时预取下一个 A tile。
+- `blas_style`：在 `tile_sram_db` 的 row block + x tile 复用基础上，将流水拆成 prologue / steady-state / epilogue 的 BLAS 风格实现。不设置 `GEMV_IMPL` 时也默认使用该 kernel。
 
 分块带来加速的主要原因是：baseline 逐元素搬运会产生大量小粒度 GDRAM 访问，带宽利用率低；分块后可以批量连续搬运，并在 NRAM 上用向量指令完成乘法和规约。`tile_sram` 进一步改善了 A tile 的搬运和组织方式，因此通常会比 `tile_nram` 更快。对于 `incx != 1` 的样例，x 需要逐元素 gather，访存效率下降，加速幅度会明显小于单位步长样例。
 
@@ -243,9 +252,11 @@ python3 autotuner/analyze_gemv_logs.py \
 - `NRAM_CHUNK_FLOATS`：每次搬到 NRAM 的 float 数量，当前默认 `256`。
 - `TILE_NRAM_BLOCK_ROWS`：`tile_nram` 的行分块大小，当前默认 `16`。
 - `TILE_SRAM_BLOCK_ROWS`：`tile_sram` 的 SRAM 行分块大小，当前默认 `16`。
-- `SRAM_BLOCK_ROWS`：默认优化版 kernel 的 SRAM 行分块大小，当前默认 `64`。
-- `PIPELINE_BUFFERS`：默认优化版 kernel 的流水缓冲数量。
-- `UNROLL_FACTOR`：默认优化版 kernel 的尾部标量累加展开因子。
+- `SRAM_BLOCK_ROWS`：旧默认优化版 kernel 的 SRAM 行分块大小，当前 `blas_style` 不使用。
+- `PIPELINE_BUFFERS`：旧默认优化版 kernel 的流水缓冲数量，当前 `blas_style` 不使用。
+- `UNROLL_FACTOR`：`blas_style` kernel 的尾部标量累加展开因子。
+
+当前阶段建议先保持 `UNROLL_FACTOR=1`，也就是不做尾部循环展开，把 `blas_style` kernel 和前面分阶段实现先放在同一基准下比较。循环展开可以后续单独设置 `UNROLL_FACTOR=2/4` 再跑一组对比，避免把“BLAS 风格流水收益”和“循环展开收益”混在一起。
 
 修改这些参数后需要重新编译：
 
