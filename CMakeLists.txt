@@ -9,6 +9,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(HAVE_MLU "Enable MLU (Cambricon) support" ON)
 option(HAVE_METAX "Enable MetaX support" OFF)
 option(BUILD_TESTS "Build GEMV tests and autotuner launcher" ON)
+option(BUILD_APPS "Build application prototypes" ON)
+option(GEMV_ENABLE_CNBLAS "Build optional cnBLAS decoder comparison path" OFF)
 
 if(HAVE_MLU AND HAVE_METAX)
     message(FATAL_ERROR "Cannot enable both MLU and MetaX simultaneously")
@@ -140,5 +142,46 @@ if(BUILD_TESTS)
         set_target_properties(gemv_bo_launcher PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
         )
+    endif()
+endif()
+
+if(BUILD_APPS)
+    if(NOT HAVE_MLU)
+        message(WARNING "Decoder application is intended for MLU builds; building it without MLU support may not be runnable")
+    endif()
+
+    add_executable(decoder_decode src/app/decoder_decode.cpp)
+    target_link_libraries(decoder_decode PRIVATE GEMV)
+    if(HAVE_MLU)
+        target_compile_definitions(decoder_decode PRIVATE GEMV_MLU_ARCH=${MLU_ARCH})
+        target_compile_definitions(decoder_decode PRIVATE
+            GEMV_BUILD_NRAM_CHUNK_FLOATS=${GEMV_NRAM_CHUNK_FLOATS}
+            GEMV_BUILD_TILE_SRAM_BLOCK_ROWS=${GEMV_TILE_SRAM_BLOCK_ROWS}
+            GEMV_BUILD_UNROLL_FACTOR=${GEMV_UNROLL_FACTOR}
+        )
+    endif()
+    set_target_properties(decoder_decode PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
+    if(GEMV_ENABLE_CNBLAS)
+        if(NOT HAVE_MLU)
+            message(FATAL_ERROR "GEMV_ENABLE_CNBLAS requires HAVE_MLU=ON")
+        endif()
+        find_path(CNBLAS_INCLUDE_DIR cnblas.h
+            PATHS ${NEUWARE_HOME}/include
+            NO_DEFAULT_PATH
+        )
+        find_library(CNBLAS_LIBRARY NAMES cnblas
+            PATHS ${NEUWARE_HOME}/lib64
+            NO_DEFAULT_PATH
+        )
+        if(NOT CNBLAS_INCLUDE_DIR OR NOT CNBLAS_LIBRARY)
+            message(FATAL_ERROR
+                "GEMV_ENABLE_CNBLAS=ON but cnblas.h or libcnblas was not found under ${NEUWARE_HOME}")
+        endif()
+        target_compile_definitions(decoder_decode PRIVATE GEMV_ENABLE_CNBLAS)
+        target_include_directories(decoder_decode PRIVATE ${CNBLAS_INCLUDE_DIR} ${NEUWARE_HOME}/include)
+        target_link_libraries(decoder_decode PRIVATE ${CNBLAS_LIBRARY} cnrt)
     endif()
 endif()
